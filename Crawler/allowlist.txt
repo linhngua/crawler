@@ -1,2 +1,4 @@
 # Eligible sources
-suffix:*.*
+suffix:org
+suffix:com
+suffix:net
