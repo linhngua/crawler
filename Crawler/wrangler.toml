@@ -1,21 +1,18 @@
-name = "crawler-books"
+name = "crawler"
 main = "src/worker.js"
-compatibility_date = "2025-12-01"
-
-
+compatibility_date = "2024-12-01"
 
 [triggers]
-crons = ["*/15 * * * *", "*/30 * * * *"]
+crons = [
+  "*/15 * * * *",
+  "*/30 * * * *"
+]
 
-[[rules]]
-type = "Text"
-globs = ["**/*.txt"]
+[build.upload]
+rules = [
+  { type = "Text", globs = ["**/*.txt"] }
+]
 
-{
-  "observability": {
-    "logs": {
-      "enabled": false,
-      "invocation_logs": true
-    }
-  }
-}
+[observability.logs]
+enabled = false
+invocation_logs = true
