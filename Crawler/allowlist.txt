@@ -1,4 +1,2 @@
 # Eligible sources
-host:openlibrary.org
-suffix:.doabooks.org
-suffix:.gutenberg.org
+suffix:*.*
