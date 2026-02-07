@@ -11,3 +11,8 @@ crons = [
 [[rules]]
 type = "Text"
 globs = ["**/*.txt"]
+
+[observability]
+[observability.logs]
+enabled = false
+invocation_logs = true
