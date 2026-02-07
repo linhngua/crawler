@@ -8,11 +8,6 @@ crons = [
   "*/30 * * * *"
 ]
 
-[build.upload]
-rules = [
-  { type = "Text", globs = ["**/*.txt"] }
-]
-
-[observability.logs]
-enabled = false
-invocation_logs = true
+[[rules]]
+type = "Text"
+globs = ["**/*.txt"]
