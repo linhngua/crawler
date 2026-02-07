@@ -10,3 +10,12 @@ crons = ["*/15 * * * *", "*/30 * * * *"]
 [[rules]]
 type = "Text"
 globs = ["**/*.txt"]
+
+{
+  "observability": {
+    "logs": {
+      "enabled": false,
+      "invocation_logs": true
+    }
+  }
+}
