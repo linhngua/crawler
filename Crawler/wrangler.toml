@@ -2,10 +2,7 @@ name = "crawler-books"
 main = "src/worker.js"
 compatibility_date = "2025-12-01"
 
-[[d1_databases]]
-binding = "DB"
-database_name = "crawler"
-database_id = "REPLACE_ME"
+
 
 [triggers]
 crons = ["*/15 * * * *", "*/30 * * * *"]
