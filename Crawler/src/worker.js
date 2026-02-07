@@ -50,14 +50,14 @@ export default {
       const auth = requireAdmin(request, env);
       if (!auth.ok) return auth.response;
       const body = await readJson(request);
-      return handleCrawlEnqueue(body, env);
+      return handleCrawlEnqueue(body, env, ctx);
     }
 
     if (request.method === "POST" && path === "/api/rank/trigger") {
       const auth = requireAdmin(request, env);
       if (!auth.ok) return auth.response;
       const body = await readJson(request);
-      return handleRankTrigger(body, env);
+      return handleRankTrigger(body, env, ctx);
     }
 
     return new Response("Not found", { status: 404 });
@@ -65,16 +65,6 @@ export default {
 
   async scheduled(event, env, ctx) {
     ctx.waitUntil(handleScheduled(event, env));
-  },
-
-  async queue(batch, env, ctx) {
-    for (const message of batch.messages) {
-      try {
-        await handleQueueMessage(message, env);
-      } catch (err) {
-        console.log("queue error", err && err.message ? err.message : String(err));
-      }
-    }
   }
 };
 
@@ -158,7 +148,7 @@ async function handleTopicInit(body, env) {
   return jsonResponse({ topic, inserted, skipped });
 }
 
-async function handleCrawlEnqueue(body, env) {
+async function handleCrawlEnqueue(body, env, ctx) {
   const topic = normalizeTopic(body.topic || "");
   if (!topic) {
     return jsonResponse({ error: "topic is required" }, 400);
@@ -173,15 +163,15 @@ async function handleCrawlEnqueue(body, env) {
     "SELECT url, topic, source FROM crawl_urls WHERE topic = ?"
   ).bind(topic).all();
 
-  const messages = rows.results || [];
-  for (const row of messages) {
-    await env.CRAWL_QUEUE.send({ type: "crawl", url: row.url, topic: row.topic, source: row.source });
+  const targets = rows.results || [];
+  if (ctx && targets.length) {
+    ctx.waitUntil(processDueCrawls(env, topic, 50));
   }
 
-  return jsonResponse({ enqueued: messages.length, topic });
+  return jsonResponse({ enqueued: targets.length, topic });
 }
 
-async function handleRankTrigger(body, env) {
+async function handleRankTrigger(body, env, ctx) {
   const topic = normalizeTopic(body.topic || "");
   const force = Boolean(body.force);
   if (!topic) {
@@ -199,6 +189,9 @@ async function handleRankTrigger(body, env) {
   ).bind(topic, nowSeconds()).run();
 
   const jobId = await createRankingJob(env, topic, force ? "manual_force" : "manual");
+  if (ctx) {
+    ctx.waitUntil(processQueuedRankingJobs(env, 1));
+  }
   return jsonResponse({ status: "queued", job_id: jobId, topic, stats });
 }
 
@@ -206,29 +199,31 @@ async function handleScheduled(event, env) {
   const cron = event && event.cron ? String(event.cron) : "";
   const runCrawl = !cron || cron.indexOf("*/15") !== -1;
   const runRank = !cron || cron.indexOf("*/30") !== -1;
-  if (runCrawl) await enqueueDueCrawls(env);
-  if (runRank) await enqueueAutoRankings(env);
-}
-
-async function handleQueueMessage(message, env) {
-  const body = normalizeMessageBody(message.body);
-  if (!body || !body.type) return;
-  if (body.type === "crawl") {
-    await handleCrawlJob(body, env);
-  } else if (body.type === "rank") {
-    await handleRankJob(body, env);
+  if (runCrawl) await processDueCrawls(env, null, 100);
+  if (runRank) {
+    await enqueueAutoRankings(env);
+    await processQueuedRankingJobs(env, 2);
   }
 }
 
-async function enqueueDueCrawls(env) {
+async function processDueCrawls(env, topic, limit) {
   const now = nowSeconds();
-  const rows = await env.DB.prepare(
-    "SELECT url, topic, source FROM crawl_urls WHERE next_crawl_at <= ? AND status IN ('queued', 'fail') LIMIT 100"
-  ).bind(now).all();
+  const cap = limit && Number(limit) > 0 ? Number(limit) : 100;
+  let stmt;
+  if (topic) {
+    stmt = env.DB.prepare(
+      "SELECT url, topic, source FROM crawl_urls WHERE topic = ? AND next_crawl_at <= ? AND status IN ('queued', 'fail') LIMIT ?"
+    ).bind(topic, now, cap);
+  } else {
+    stmt = env.DB.prepare(
+      "SELECT url, topic, source FROM crawl_urls WHERE next_crawl_at <= ? AND status IN ('queued', 'fail') LIMIT ?"
+    ).bind(now, cap);
+  }
 
+  const rows = await stmt.all();
   const targets = rows.results || [];
   for (const row of targets) {
-    await env.CRAWL_QUEUE.send({ type: "crawl", url: row.url, topic: row.topic, source: row.source });
+    await handleCrawlJob({ url: row.url, topic: row.topic, source: row.source }, env);
   }
 }
 
@@ -248,6 +243,8 @@ async function enqueueAutoRankings(env) {
     const topic = row.topic;
     const locked = await isTopicLocked(env.DB, topic);
     if (locked) continue;
+    const openJob = await hasOpenRankingJob(env.DB, topic);
+    if (openJob) continue;
     await createRankingJob(env, topic, "auto_threshold");
   }
 }
@@ -321,7 +318,7 @@ async function handleRankJob(payload, env) {
   const now = nowSeconds();
   const lockOk = await acquireTopicLock(env.DB, topic, jobId, now);
   if (!lockOk) {
-    await updateRankingJob(env.DB, jobId, "skipped", "topic_locked", now, now, null);
+    await updateRankingJob(env.DB, jobId, "queued", "topic_locked", null, null, null);
     return;
   }
 
@@ -750,7 +747,6 @@ async function createRankingJob(env, topic, reason) {
     "INSERT INTO ranking_jobs (job_id, topic, status, reason, created_at) VALUES (?, ?, ?, ?, ?)"
   ).bind(jobId, topic, "queued", reason, now).run();
 
-  await env.RANK_QUEUE.send({ type: "rank", topic, job_id: jobId });
   return jobId;
 }
 
@@ -759,6 +755,25 @@ async function updateRankingJob(db, jobId, status, reason, startedAt, finishedAt
     "UPDATE ranking_jobs SET status = ?, reason = COALESCE(?, reason), started_at = COALESCE(?, started_at), " +
       "finished_at = COALESCE(?, finished_at), error = COALESCE(?, error) WHERE job_id = ?"
   ).bind(status, reason, startedAt, finishedAt, error, jobId).run();
+}
+
+async function hasOpenRankingJob(db, topic) {
+  const row = await db.prepare(
+    "SELECT job_id FROM ranking_jobs WHERE topic = ? AND status IN ('queued', 'running') LIMIT 1"
+  ).bind(topic).first();
+  return Boolean(row && row.job_id);
+}
+
+async function processQueuedRankingJobs(env, limit) {
+  const cap = limit && Number(limit) > 0 ? Number(limit) : 1;
+  const rows = await env.DB.prepare(
+    "SELECT job_id, topic FROM ranking_jobs WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?"
+  ).bind(cap).all();
+
+  const jobs = rows.results || [];
+  for (const job of jobs) {
+    await handleRankJob({ topic: job.topic, job_id: job.job_id }, env);
+  }
 }
 
 async function acquireTopicLock(db, topic, jobId, now) {
@@ -1036,14 +1051,6 @@ function detectSourceFromUrl(urlString) {
     return "";
   }
   return "";
-}
-
-function normalizeMessageBody(body) {
-  if (!body) return null;
-  if (typeof body === "string") {
-    return safeJsonParse(body, null);
-  }
-  return body;
 }
 
 function normalizeTopic(topic) {

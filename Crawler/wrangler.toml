@@ -7,24 +7,6 @@ binding = "DB"
 database_name = "crawler"
 database_id = "REPLACE_ME"
 
-[[queues.producers]]
-binding = "CRAWL_QUEUE"
-queue = "crawl_queue"
-
-[[queues.producers]]
-binding = "RANK_QUEUE"
-queue = "rank_queue"
-
-[[queues.consumers]]
-queue = "crawl_queue"
-max_batch_size = 5
-max_batch_timeout = 30
-
-[[queues.consumers]]
-queue = "rank_queue"
-max_batch_size = 1
-max_batch_timeout = 30
-
 [triggers]
 crons = ["*/15 * * * *", "*/30 * * * *"]
 
