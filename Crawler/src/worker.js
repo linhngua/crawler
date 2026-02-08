@@ -29,6 +29,18 @@ export default {
       return handleHome(request, env);
     }
 
+    if (request.method === "POST" && path === "/ui/topic/init") {
+      return handleUiTopicInit(request, env);
+    }
+
+    if (request.method === "POST" && path === "/ui/crawl/enqueue") {
+      return handleUiCrawlEnqueue(request, env, ctx);
+    }
+
+    if (request.method === "POST" && path === "/ui/rank/trigger") {
+      return handleUiRankTrigger(request, env, ctx);
+    }
+
     if (request.method === "GET" && path === "/api/books") {
       return handleApiBooks(url, env);
     }
@@ -71,6 +83,8 @@ export default {
 async function handleHome(request, env) {
   const url = new URL(request.url);
   const topic = normalizeTopic(url.searchParams.get("topic") || "");
+  const msg = cleanText(url.searchParams.get("msg") || "");
+  const err = cleanText(url.searchParams.get("err") || "");
   let stats = null;
   let books = [];
   if (topic) {
@@ -78,8 +92,58 @@ async function handleHome(request, env) {
     books = await listRankedBooks(env, topic, 100);
   }
 
-  const html = renderHomeHtml(topic, stats, books);
+  const html = renderHomeHtml(topic, stats, books, msg, err);
   return htmlResponse(html);
+}
+
+async function handleUiTopicInit(request, env) {
+  const form = await readForm(request);
+  const topic = normalizeTopic(form.topic || "");
+  if (!topic) return redirectResponse("/", { err: "topic is required" });
+
+  const result = await initTopic(env, topic);
+  const insertedCount = (result.inserted || []).length;
+  return redirectResponse("/", {
+    topic,
+    msg: "topic initialized (seeds inserted: " + insertedCount + ")"
+  });
+}
+
+async function handleUiCrawlEnqueue(request, env, ctx) {
+  const form = await readForm(request);
+  const topic = normalizeTopic(form.topic || "");
+  if (!topic) return redirectResponse("/", { err: "topic is required" });
+
+  const auth = requireAdminToken(form.admin_token, env);
+  if (!auth.ok) return redirectResponse("/", { topic, err: auth.error || "unauthorized" });
+
+  const result = await enqueueCrawlForTopic(env, topic, ctx);
+  return redirectResponse("/", {
+    topic,
+    msg: "crawl enqueued (urls: " + result.enqueued + ")"
+  });
+}
+
+async function handleUiRankTrigger(request, env, ctx) {
+  const form = await readForm(request);
+  const topic = normalizeTopic(form.topic || "");
+  if (!topic) return redirectResponse("/", { err: "topic is required" });
+
+  const auth = requireAdminToken(form.admin_token, env);
+  if (!auth.ok) return redirectResponse("/", { topic, err: auth.error || "unauthorized" });
+
+  const force = normalizeBool(form.force);
+  const result = await triggerRankingForTopic(env, topic, force, ctx);
+  if (result.status === "skipped") {
+    return redirectResponse("/", {
+      topic,
+      msg: "rank skipped (" + result.reason + ")"
+    });
+  }
+  return redirectResponse("/", {
+    topic,
+    msg: "rank job queued (" + result.job_id + ")"
+  });
 }
 
 async function handleApiBooks(url, env) {
@@ -106,6 +170,32 @@ async function handleTopicInit(body, env) {
     return jsonResponse({ error: "topic is required" }, 400);
   }
 
+  const result = await initTopic(env, topic);
+  return jsonResponse(result);
+}
+
+async function handleCrawlEnqueue(body, env, ctx) {
+  const topic = normalizeTopic(body.topic || "");
+  if (!topic) {
+    return jsonResponse({ error: "topic is required" }, 400);
+  }
+
+  const result = await enqueueCrawlForTopic(env, topic, ctx);
+  return jsonResponse(result);
+}
+
+async function handleRankTrigger(body, env, ctx) {
+  const topic = normalizeTopic(body.topic || "");
+  const force = Boolean(body.force);
+  if (!topic) {
+    return jsonResponse({ error: "topic is required" }, 400);
+  }
+
+  const result = await triggerRankingForTopic(env, topic, force, ctx);
+  return jsonResponse(result);
+}
+
+async function initTopic(env, topic) {
   const now = nowSeconds();
   const seeds = buildSeedUrls(topic);
   const statements = [];
@@ -113,9 +203,7 @@ async function handleTopicInit(body, env) {
   const inserted = [];
 
   statements.push(
-    env.DB.prepare(
-      "INSERT INTO topic_state (topic) VALUES (?) ON CONFLICT(topic) DO NOTHING"
-    ).bind(topic)
+    env.DB.prepare("INSERT INTO topic_state (topic) VALUES (?) ON CONFLICT(topic) DO NOTHING").bind(topic)
   );
 
   for (const seed of seeds) {
@@ -145,42 +233,31 @@ async function handleTopicInit(body, env) {
     await env.DB.batch(statements);
   }
 
-  return jsonResponse({ topic, inserted, skipped });
+  return { topic, inserted, skipped };
 }
 
-async function handleCrawlEnqueue(body, env, ctx) {
-  const topic = normalizeTopic(body.topic || "");
-  if (!topic) {
-    return jsonResponse({ error: "topic is required" }, 400);
-  }
-
+async function enqueueCrawlForTopic(env, topic, ctx) {
   const now = nowSeconds();
-  await env.DB.prepare(
-    "UPDATE crawl_urls SET status = 'queued', next_crawl_at = ? WHERE topic = ?"
-  ).bind(now, topic).run();
+  await env.DB.prepare("UPDATE crawl_urls SET status = 'queued', next_crawl_at = ? WHERE topic = ?")
+    .bind(now, topic)
+    .run();
 
-  const rows = await env.DB.prepare(
-    "SELECT url, topic, source FROM crawl_urls WHERE topic = ?"
-  ).bind(topic).all();
+  const rows = await env.DB.prepare("SELECT url, topic, source FROM crawl_urls WHERE topic = ?")
+    .bind(topic)
+    .all();
 
   const targets = rows.results || [];
   if (ctx && targets.length) {
     ctx.waitUntil(processDueCrawls(env, topic, 50));
   }
 
-  return jsonResponse({ enqueued: targets.length, topic });
+  return { enqueued: targets.length, topic };
 }
 
-async function handleRankTrigger(body, env, ctx) {
-  const topic = normalizeTopic(body.topic || "");
-  const force = Boolean(body.force);
-  if (!topic) {
-    return jsonResponse({ error: "topic is required" }, 400);
-  }
-
+async function triggerRankingForTopic(env, topic, force, ctx) {
   const stats = await getTopicStats(env, topic);
   if (!force && stats.unranked_books <= RANK_THRESHOLD) {
-    return jsonResponse({ status: "skipped", reason: "threshold_not_met", stats });
+    return { status: "skipped", reason: "threshold_not_met", stats };
   }
 
   await env.DB.prepare(
@@ -192,7 +269,7 @@ async function handleRankTrigger(body, env, ctx) {
   if (ctx) {
     ctx.waitUntil(processQueuedRankingJobs(env, 1));
   }
-  return jsonResponse({ status: "queued", job_id: jobId, topic, stats });
+  return { status: "queued", job_id: jobId, topic, stats };
 }
 
 async function handleScheduled(event, env) {
@@ -874,8 +951,11 @@ function sanitizeBookForDisplay(row) {
   };
 }
 
-function renderHomeHtml(topic, stats, books) {
+function renderHomeHtml(topic, stats, books, msg, err) {
   const safeTopic = escapeHtml(topic || "");
+  const topicParam = encodeURIComponent(topic || "");
+  const msgHtml = msg ? "<div class=\"msg\">" + escapeHtml(msg) + "</div>" : "";
+  const errHtml = err ? "<div class=\"err\">" + escapeHtml(err) + "</div>" : "";
   const statsHtml = stats
     ? "<div>total_books: " + stats.total_books + "</div>" +
       "<div>ranked_books: " + stats.ranked_books + "</div>" +
@@ -916,15 +996,48 @@ function renderHomeHtml(topic, stats, books) {
     "<style>" +
     "body{font-family:Arial,sans-serif;margin:24px;max-width:900px;}" +
     "input,button{padding:8px;font-size:14px;}" +
+    "form{margin:0;}" +
+    ".msg{background:#e7f5ff;border:1px solid #a5d8ff;padding:10px;border-radius:6px;margin:12px 0;}" +
+    ".err{background:#fff5f5;border:1px solid #ffc9c9;padding:10px;border-radius:6px;margin:12px 0;}" +
+    ".actions{margin:12px 0;padding:12px;border:1px solid #eee;border-radius:8px;background:#fafafa;}" +
+    ".actions form{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0;}" +
+    ".hint{color:#555;font-size:13px;margin:6px 0;}" +
+    ".check{display:flex;align-items:center;gap:6px;}" +
     "ol{padding-left:20px;}" +
     "li{margin:12px 0;padding:12px;border:1px solid #ddd;border-radius:6px;}" +
     "</style></head><body>" +
     "<h1>Open Access Book Ranker</h1>" +
+    errHtml +
+    msgHtml +
     "<form method=\"GET\" action=\"/\">" +
     "<label>Topic</label> " +
     "<input type=\"text\" name=\"topic\" value=\"" + safeTopic + "\" size=\"40\"> " +
     "<button type=\"submit\">Search</button>" +
     "</form>" +
+    "<div class=\"hint\">" +
+    (topic ? "<a href=\"/api/stats?topic=" + topicParam + "\" rel=\"noopener\">stats json</a> | " : "") +
+    (topic ? "<a href=\"/api/books?topic=" + topicParam + "\" rel=\"noopener\">books json</a> | " : "") +
+    "<a href=\"/api/allowlist\" rel=\"noopener\">allowlist</a>" +
+    "</div>" +
+    "<h2>Actions</h2>" +
+    "<div class=\"actions\">" +
+    "<form method=\"POST\" action=\"/ui/topic/init\">" +
+    "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
+    "<button type=\"submit\">Init topic</button>" +
+    "</form>" +
+    "<form method=\"POST\" action=\"/ui/crawl/enqueue\" autocomplete=\"off\">" +
+    "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
+    "<input type=\"password\" name=\"admin_token\" placeholder=\"ADMIN_TOKEN\" size=\"28\" autocomplete=\"off\">" +
+    "<button type=\"submit\">Crawl now</button>" +
+    "</form>" +
+    "<form method=\"POST\" action=\"/ui/rank/trigger\" autocomplete=\"off\">" +
+    "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
+    "<input type=\"password\" name=\"admin_token\" placeholder=\"ADMIN_TOKEN\" size=\"28\" autocomplete=\"off\">" +
+    "<label class=\"check\"><input type=\"checkbox\" name=\"force\" value=\"1\">Force</label>" +
+    "<button type=\"submit\">Rank now</button>" +
+    "</form>" +
+    "<div class=\"hint\">Admin token is not stored; it is only sent with this request.</div>" +
+    "</div>" +
     "<h2>Stats</h2>" +
     statsHtml +
     "<h2>Ranked Books</h2>" +
@@ -1057,6 +1170,12 @@ function normalizeTopic(topic) {
   return String(topic || "").trim();
 }
 
+function normalizeBool(value) {
+  if (value === undefined || value === null) return false;
+  const s = String(value).trim().toLowerCase();
+  return s === "1" || s === "true" || s === "on" || s === "yes";
+}
+
 function jsonResponse(data, status) {
   return new Response(JSON.stringify(data, null, 2), {
     status: status || 200,
@@ -1068,6 +1187,23 @@ function htmlResponse(body, status) {
   return new Response(body, {
     status: status || 200,
     headers: { "content-type": "text/html; charset=utf-8" }
+  });
+}
+
+function redirectResponse(pathname, params) {
+  const url = new URL(pathname || "/", "https://redirect.invalid");
+  if (params && typeof params === "object") {
+    for (const key of Object.keys(params)) {
+      const value = params[key];
+      if (value === undefined || value === null) continue;
+      const str = String(value);
+      if (!str) continue;
+      url.searchParams.set(key, str);
+    }
+  }
+  return new Response(null, {
+    status: 303,
+    headers: { location: url.pathname + url.search }
   });
 }
 
@@ -1083,6 +1219,14 @@ function requireAdmin(request, env) {
 
   if (token && token === expected) return { ok: true };
   return { ok: false, response: jsonResponse({ error: "unauthorized" }, 401) };
+}
+
+function requireAdminToken(token, env) {
+  const expected = env.ADMIN_TOKEN;
+  if (!expected) return { ok: false, error: "ADMIN_TOKEN not configured" };
+  const provided = String(token || "");
+  if (provided && provided === expected) return { ok: true };
+  return { ok: false, error: "unauthorized" };
 }
 
 function safeJsonParse(text, fallback) {
@@ -1250,4 +1394,15 @@ async function readJson(request) {
   const text = await request.text();
   if (!text) return {};
   return safeJsonParse(text, {});
+}
+
+async function readForm(request) {
+  const text = await request.text();
+  if (!text) return {};
+  const params = new URLSearchParams(text);
+  const obj = {};
+  for (const [key, value] of params.entries()) {
+    obj[key] = value;
+  }
+  return obj;
 }
