@@ -20,6 +20,9 @@ const MAX_RANK_BATCH = 200;
 const RANK_THRESHOLD = 50;
 const LOCK_SECONDS = 900;
 
+const DOAB_DSPACE_BASE = "https://directory.doabooks.org";
+const DOAB_BOOKS_COLLECTION_UUID = "d4141a88-deff-46c2-a9d6-3615acf3a4f0";
+
 export default {
   async fetch(request, env, ctx) {
     const url = new URL(request.url);
@@ -47,6 +50,10 @@ export default {
 
     if (request.method === "GET" && path === "/api/stats") {
       return handleApiStats(url, env);
+    }
+
+    if (request.method === "GET" && path === "/api/crawls") {
+      return handleApiCrawls(url, env);
     }
 
     if (request.method === "GET" && path === "/api/allowlist") {
@@ -85,14 +92,21 @@ async function handleHome(request, env) {
   const topic = normalizeTopic(url.searchParams.get("topic") || "");
   const msg = cleanText(url.searchParams.get("msg") || "");
   const err = cleanText(url.searchParams.get("err") || "");
+  const view = cleanText(url.searchParams.get("view") || "");
   let stats = null;
   let books = [];
+  let crawls = [];
+  let recentBooks = [];
   if (topic) {
     stats = await getTopicStats(env, topic);
     books = await listRankedBooks(env, topic, 100);
+    if (view === "crawl") {
+      crawls = await listCrawlUrls(env, topic, 200);
+      recentBooks = await listRecentBooks(env, topic, 50);
+    }
   }
 
-  const html = renderHomeHtml(topic, stats, books, msg, err);
+  const html = renderHomeHtml(topic, stats, books, msg, err, view, crawls, recentBooks);
   return htmlResponse(html);
 }
 
@@ -162,6 +176,16 @@ async function handleApiStats(url, env) {
   }
   const stats = await getTopicStats(env, topic);
   return jsonResponse(stats);
+}
+
+async function handleApiCrawls(url, env) {
+  const topic = normalizeTopic(url.searchParams.get("topic") || "");
+  if (!topic) {
+    return jsonResponse({ error: "topic is required" }, 400);
+  }
+  const limit = Number(url.searchParams.get("limit") || "200");
+  const crawls = await listCrawlUrls(env, topic, limit);
+  return jsonResponse({ topic, crawls });
 }
 
 async function handleTopicInit(body, env) {
@@ -533,6 +557,10 @@ function parseOpenLibrary(data, topic) {
 }
 
 function parseDoab(data, topic) {
+  if (Array.isArray(data) && data.length && looksLikeDoabDspaceItem(data[0])) {
+    return parseDoabDspaceItems(data, topic);
+  }
+
   const items = extractDoabItems(data);
   const books = [];
   for (const item of items) {
@@ -593,6 +621,118 @@ function parseDoab(data, topic) {
   }
 
   return books;
+}
+
+function looksLikeDoabDspaceItem(item) {
+  if (!item || typeof item !== "object") return false;
+  if (typeof item.uuid !== "string") return false;
+  return Array.isArray(item.metadata) || item.metadata === null;
+}
+
+function parseDoabDspaceItems(items, topic) {
+  const books = [];
+  for (const item of items) {
+    if (!item || typeof item !== "object") continue;
+
+    const md = Array.isArray(item.metadata) ? item.metadata : [];
+    const title = cleanText(firstMetadataValue(md, "dc.title") || item.name || "");
+    if (!title) continue;
+
+    const authors = joinMetadataValues(md, "dc.contributor.author");
+    const year = toYear(firstMetadataValue(md, "dc.date.issued") || firstMetadataValue(md, "dc.date.available"));
+    const language = joinMetadataValues(md, "dc.language");
+
+    const licenseHint =
+      cleanText(
+        firstMetadataValue(md, "dc.rights.uri") ||
+          firstMetadataValue(md, "dc.rights.license") ||
+          firstMetadataValue(md, "dc.rights.licenseurl") ||
+          firstMetadataValue(md, "dc.rights")
+      ) || "open_access";
+
+    const landingUrl =
+      cleanText(firstMetadataValue(md, "dc.identifier.uri")) ||
+      (item.handle ? DOAB_DSPACE_BASE + "/handle/" + String(item.handle) : "");
+
+    const downloadUrl = pickDoabBitstreamDownloadUrl(item.bitstreams);
+
+    books.push({
+      id: null,
+      topic,
+      source: "doab",
+      title,
+      authors: authors || null,
+      year,
+      language: language || null,
+      license_hint: licenseHint,
+      landing_url: landingUrl,
+      download_url: downloadUrl || null
+    });
+  }
+
+  return books;
+}
+
+function firstMetadataValue(metadata, key) {
+  if (!Array.isArray(metadata)) return "";
+  for (const m of metadata) {
+    if (!m || typeof m !== "object") continue;
+    if (m.key === key && typeof m.value === "string" && m.value.trim()) return m.value.trim();
+  }
+  return "";
+}
+
+function joinMetadataValues(metadata, key) {
+  if (!Array.isArray(metadata)) return null;
+  const values = [];
+  for (const m of metadata) {
+    if (!m || typeof m !== "object") continue;
+    if (m.key !== key) continue;
+    if (typeof m.value !== "string") continue;
+    const v = cleanText(m.value);
+    if (v) values.push(v);
+  }
+  if (!values.length) return null;
+  return values.join("; ");
+}
+
+function pickDoabBitstreamDownloadUrl(bitstreams) {
+  if (!Array.isArray(bitstreams) || bitstreams.length === 0) return "";
+
+  let bestUrl = "";
+  let bestScore = -1;
+
+  for (const bs of bitstreams) {
+    if (!bs || typeof bs !== "object") continue;
+    const bundle = String(bs.bundleName || "");
+    if (bundle === "THUMBNAIL" || bundle === "LICENSE") continue;
+    const retrieve = typeof bs.retrieveLink === "string" ? bs.retrieveLink : "";
+    const url = absolutizeUrl(DOAB_DSPACE_BASE, retrieve);
+    if (!url) continue;
+
+    const mime = String(bs.mimeType || "").toLowerCase();
+    const name = String(bs.name || "").toLowerCase();
+
+    let score = 0;
+    if (bundle === "ORIGINAL") score += 100;
+    if (mime.indexOf("pdf") !== -1 || name.endsWith(".pdf")) score += 50;
+    if (mime.indexOf("epub") !== -1 || name.endsWith(".epub")) score += 40;
+    if (mime.indexOf("zip") !== -1 || name.endsWith(".zip")) score += 10;
+
+    if (score > bestScore) {
+      bestScore = score;
+      bestUrl = url;
+    }
+  }
+
+  return bestUrl;
+}
+
+function absolutizeUrl(base, path) {
+  if (!path) return "";
+  if (path.startsWith("http://") || path.startsWith("https://")) return path;
+  if (path.startsWith("/")) return base + path;
+  return base + "/" + path;
 }
 
 function parseGutenberg(urlString, html, topic) {
@@ -904,6 +1044,75 @@ async function listRankedBooks(env, topic, limit) {
   return (rows.results || []).map(sanitizeBookForDisplay);
 }
 
+async function listRecentBooks(env, topic, limit) {
+  const cap = clampLimit(limit, 1, 200);
+  const rows = await env.DB.prepare(
+    "SELECT b.* FROM books b WHERE b.topic = ? ORDER BY b.updated_at DESC LIMIT ?"
+  ).bind(topic, cap).all();
+
+  return (rows.results || []).map(sanitizeBookForDisplay);
+}
+
+async function listCrawlUrls(env, topic, limit) {
+  const cap = clampLimit(limit, 1, 500);
+  const rows = await env.DB.prepare(
+    "SELECT url, source, status, last_crawled_at, next_crawl_at, fail_count, last_error " +
+      "FROM crawl_urls WHERE topic = ? " +
+      "ORDER BY COALESCE(last_crawled_at, 0) DESC, url ASC " +
+      "LIMIT ?"
+  ).bind(topic, cap).all();
+
+  return (rows.results || []).map(sanitizeCrawlForDisplay);
+}
+
+function sanitizeCrawlForDisplay(row) {
+  const allowed = isAllowedForDisplay(row.url);
+  return {
+    url: allowed ? row.url : null,
+    url_redacted: !allowed,
+    source: row.source || null,
+    status: row.status || null,
+    last_crawled_at: row.last_crawled_at || null,
+    next_crawl_at: row.next_crawl_at || null,
+    fail_count: Number(row.fail_count || 0),
+    last_error: row.last_error || null
+  };
+}
+
+function buildCrawlSummaryHtml(crawls) {
+  if (!Array.isArray(crawls) || crawls.length === 0) {
+    return "<div class=\"hint\">No crawl urls for this topic yet.</div>";
+  }
+
+  const counts = {};
+  for (const c of crawls) {
+    const status = c && c.status ? String(c.status) : "unknown";
+    counts[status] = (counts[status] || 0) + 1;
+  }
+
+  const parts = [];
+  for (const key of Object.keys(counts).sort()) {
+    parts.push(escapeHtml(key) + ": " + counts[key]);
+  }
+  return "<div class=\"hint\">rows: " + crawls.length + (parts.length ? " | " + parts.join(" | ") : "") + "</div>";
+}
+
+function formatTimeSeconds(seconds) {
+  const num = Number(seconds);
+  if (!Number.isFinite(num) || num <= 0) return "";
+  try {
+    return new Date(num * 1000).toISOString();
+  } catch (err) {
+    return String(seconds || "");
+  }
+}
+
+function clampLimit(value, min, max) {
+  const num = Math.floor(Number(value));
+  if (!Number.isFinite(num)) return min;
+  return Math.max(min, Math.min(max, num));
+}
+
 async function getTopicStats(env, topic) {
   const totalRow = await env.DB.prepare(
     "SELECT COUNT(*) AS count FROM books WHERE topic = ?"
@@ -951,11 +1160,12 @@ function sanitizeBookForDisplay(row) {
   };
 }
 
-function renderHomeHtml(topic, stats, books, msg, err) {
+function renderHomeHtml(topic, stats, books, msg, err, view, crawls, recentBooks) {
   const safeTopic = escapeHtml(topic || "");
   const topicParam = encodeURIComponent(topic || "");
   const msgHtml = msg ? "<div class=\"msg\">" + escapeHtml(msg) + "</div>" : "";
   const errHtml = err ? "<div class=\"err\">" + escapeHtml(err) + "</div>" : "";
+  const isCrawlView = view === "crawl";
   const statsHtml = stats
     ? "<div>total_books: " + stats.total_books + "</div>" +
       "<div>ranked_books: " + stats.ranked_books + "</div>" +
@@ -963,6 +1173,71 @@ function renderHomeHtml(topic, stats, books, msg, err) {
       "<div>running_job_id: " + escapeHtml(stats.running_job_id || "") + "</div>" +
       "<div>last_ranked_at: " + (stats.last_ranked_at || "") + "</div>"
     : "<div>No topic selected.</div>";
+
+  const crawlSummary = buildCrawlSummaryHtml(crawls || []);
+  const crawlRows = (crawls || []).map((c) => {
+    const urlLabel = c.url ? escapeHtml(c.url) : "[redacted]";
+    const urlHtml = c.url
+      ? "<a href=\"" + escapeHtml(c.url) + "\" rel=\"noopener\">open</a>"
+      : "";
+    const last = formatTimeSeconds(c.last_crawled_at);
+    const next = formatTimeSeconds(c.next_crawl_at);
+    const errText = escapeHtml(c.last_error || "");
+    const status = escapeHtml(c.status || "");
+    const source = escapeHtml(c.source || "");
+    const fails = String(c.fail_count || 0);
+    return (
+      "<tr>" +
+      "<td class=\"mono\">" + urlLabel + (urlHtml ? "<div>" + urlHtml + "</div>" : "") + "</td>" +
+      "<td>" + source + "</td>" +
+      "<td>" + status + "</td>" +
+      "<td class=\"mono\">" + last + "</td>" +
+      "<td class=\"mono\">" + next + "</td>" +
+      "<td class=\"mono\">" + fails + "</td>" +
+      "<td class=\"mono\">" + errText + "</td>" +
+      "</tr>"
+    );
+  }).join("");
+
+  const recentItems = (recentBooks || []).map((book) => {
+    const title = escapeHtml(book.title || "");
+    const authors = escapeHtml(book.authors || "");
+    const landingLink = book.landing_url
+      ? "<a href=\"" + escapeHtml(book.landing_url) + "\" rel=\"noopener\">landing</a>"
+      : "";
+    const downloadLink = book.download_url
+      ? "<a href=\"" + escapeHtml(book.download_url) + "\" rel=\"noopener\">download</a>"
+      : "";
+    const meta = [
+      book.source ? "source: " + escapeHtml(book.source) : "",
+      book.year ? "year: " + String(book.year) : "",
+      book.language ? "lang: " + escapeHtml(book.language) : ""
+    ].filter(Boolean).join(" | ");
+    return (
+      "<li>" +
+      "<div><strong>" + title + "</strong></div>" +
+      (authors ? "<div>Authors: " + authors + "</div>" : "") +
+      (meta ? "<div class=\"hint\">" + meta + "</div>" : "") +
+      "<div>" + landingLink + (landingLink && downloadLink ? " | " : "") + downloadLink + "</div>" +
+      "</li>"
+    );
+  }).join("");
+
+  const crawlSection = isCrawlView
+    ? "<h2>Crawl Activity</h2>" +
+      "<div class=\"hint\">" +
+      "<a href=\"/api/crawls?topic=" + topicParam + "\" rel=\"noopener\">crawl urls json</a>" +
+      "</div>" +
+      crawlSummary +
+      "<table class=\"table\">" +
+      "<thead><tr>" +
+      "<th>URL</th><th>Source</th><th>Status</th><th>Last</th><th>Next</th><th>Fails</th><th>Error</th>" +
+      "</tr></thead>" +
+      "<tbody>" + crawlRows + "</tbody>" +
+      "</table>" +
+      "<h2>Recent Books</h2>" +
+      "<ol>" + recentItems + "</ol>"
+    : "";
 
   const listItems = (books || []).map((book) => {
     const title = escapeHtml(book.title || "");
@@ -1003,6 +1278,10 @@ function renderHomeHtml(topic, stats, books, msg, err) {
     ".actions form{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0;}" +
     ".hint{color:#555;font-size:13px;margin:6px 0;}" +
     ".check{display:flex;align-items:center;gap:6px;}" +
+    ".table{border-collapse:collapse;width:100%;margin:12px 0;}" +
+    ".table th,.table td{border:1px solid #ddd;padding:8px;vertical-align:top;}" +
+    ".table th{background:#f6f6f6;text-align:left;}" +
+    ".mono{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;font-size:12px;}" +
     "ol{padding-left:20px;}" +
     "li{margin:12px 0;padding:12px;border:1px solid #ddd;border-radius:6px;}" +
     "</style></head><body>" +
@@ -1015,6 +1294,9 @@ function renderHomeHtml(topic, stats, books, msg, err) {
     "<button type=\"submit\">Search</button>" +
     "</form>" +
     "<div class=\"hint\">" +
+    (topic ? (isCrawlView
+      ? "<a href=\"/?topic=" + topicParam + "\" rel=\"noopener\">back to rankings</a> | "
+      : "<a href=\"/?topic=" + topicParam + "&view=crawl\" rel=\"noopener\">crawl activity</a> | ") : "") +
     (topic ? "<a href=\"/api/stats?topic=" + topicParam + "\" rel=\"noopener\">stats json</a> | " : "") +
     (topic ? "<a href=\"/api/books?topic=" + topicParam + "\" rel=\"noopener\">books json</a> | " : "") +
     "<a href=\"/api/allowlist\" rel=\"noopener\">allowlist</a>" +
@@ -1024,6 +1306,11 @@ function renderHomeHtml(topic, stats, books, msg, err) {
     "<form method=\"POST\" action=\"/ui/topic/init\">" +
     "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
     "<button type=\"submit\">Init topic</button>" +
+    "</form>" +
+    "<form method=\"GET\" action=\"/\">" +
+    "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
+    "<input type=\"hidden\" name=\"view\" value=\"crawl\">" +
+    "<button type=\"submit\">View crawl log</button>" +
     "</form>" +
     "<form method=\"POST\" action=\"/ui/crawl/enqueue\" autocomplete=\"off\">" +
     "<input type=\"hidden\" name=\"topic\" value=\"" + safeTopic + "\">" +
@@ -1040,6 +1327,7 @@ function renderHomeHtml(topic, stats, books, msg, err) {
     "</div>" +
     "<h2>Stats</h2>" +
     statsHtml +
+    crawlSection +
     "<h2>Ranked Books</h2>" +
     "<ol>" + listItems + "</ol>" +
     "</body></html>"
@@ -1051,7 +1339,12 @@ function buildSeedUrls(topic) {
   return [
     {
       source: "doab",
-      url: "https://www.doabooks.org/api/books?query=" + encoded
+      url:
+        DOAB_DSPACE_BASE +
+        "/rest/collections/" +
+        DOAB_BOOKS_COLLECTION_UUID +
+        "/items?expand=metadata,bitstreams&limit=50&offset=0&query=" +
+        encoded
     },
     {
       source: "openlibrary",
